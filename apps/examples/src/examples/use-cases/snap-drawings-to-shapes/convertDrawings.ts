@@ -37,7 +37,10 @@ const MAX_ARROWHEAD_RATIO = 0.6
 
 interface Stroke<R> {
 	shape: TLDrawShape
+	/** In the space of the stroke's parent. */
 	recognition: R
+	/** Maps the parent's space to page space. */
+	parentTransform: Mat
 }
 
 interface DrawnArrowheads {
@@ -67,36 +70,44 @@ export function convertDrawingsToShapes(editor: Editor): ConversionResult {
 	const lineStrokes: Stroke<LineStrokeRecognition>[] = []
 	const chevronStrokes: Stroke<ChevronStrokeRecognition>[] = []
 	for (const shape of strokes) {
+		// [1]
 		const points = editor
-			.getShapePageTransform(shape)
+			.getShapeLocalTransform(shape)
 			.applyToPoints(
 				getPointsFromDrawSegments(shape.props.segments, shape.props.scaleX, shape.props.scaleY)
 			)
 		const recognition = recognizeStroke(points)
-		if (recognition.kind === 'line') lineStrokes.push({ shape, recognition })
-		else if (recognition.kind === 'chevron') chevronStrokes.push({ shape, recognition })
-		else if (recognition.kind !== 'unknown') geoStrokes.push({ shape, recognition })
+		const parentTransform = editor.getShapeParentTransform(shape)
+		if (recognition.kind === 'line') lineStrokes.push({ shape, recognition, parentTransform })
+		else if (recognition.kind === 'chevron') {
+			chevronStrokes.push({ shape, recognition, parentTransform })
+		} else if (recognition.kind !== 'unknown') {
+			geoStrokes.push({ shape, recognition, parentTransform })
+		}
 	}
 
 	const result = { converted: 0, total: strokes.length }
 	if (geoStrokes.length === 0 && lineStrokes.length === 0) return result
 
-	// [1]
+	// [2]
 	const markId = editor.markHistoryStoppingPoint('convert drawings to shapes')
 	const created: TLShapeId[] = []
 	const replaced = new Set<TLShapeId>()
 	editor.run(() => {
-		// [2]
+		// [3]
 		for (const stroke of geoStrokes) {
 			created.push(createGeoShape(editor, stroke))
 			replaced.add(stroke.shape.id)
 		}
 
 		const arrowheads = matchArrowheads(editor, lineStrokes, chevronStrokes)
-		const sources = new Set(strokes.map((shape) => shape.id))
+		// Strokes that stay as ink are still shapes an arrow can connect to.
+		const recognized = new Set(
+			[...geoStrokes, ...lineStrokes, ...chevronStrokes].map((stroke) => stroke.shape.id)
+		)
 		for (const stroke of lineStrokes) {
 			const drawnArrowheads = arrowheads.get(stroke.shape.id) ?? {}
-			const id = createLineOrArrow(editor, stroke, drawnArrowheads, sources)
+			const id = createLineOrArrow(editor, stroke, drawnArrowheads, recognized)
 			if (!id) continue
 			created.push(id)
 			replaced.add(stroke.shape.id)
@@ -104,7 +115,7 @@ export function convertDrawingsToShapes(editor: Editor): ConversionResult {
 			if (drawnArrowheads.end) replaced.add(drawnArrowheads.end)
 		}
 
-		// [3]
+		// [4]
 		editor.deleteShapes([...replaced])
 		editor.setSelectedShapes([
 			...created,
@@ -112,7 +123,7 @@ export function convertDrawingsToShapes(editor: Editor): ConversionResult {
 		])
 	})
 
-	// [4]
+	// [5]
 	if (created.length === 0) editor.bailToMark(markId)
 	result.converted = replaced.size
 	return result
@@ -120,10 +131,8 @@ export function convertDrawingsToShapes(editor: Editor): ConversionResult {
 
 function createGeoShape(editor: Editor, { shape, recognition }: Stroke<GeoStrokeRecognition>) {
 	const { center, width, height, rotation, flipY } = recognition
-	// [5]
-	const parentTransform = editor.getShapeParentTransform(shape)
-	const pageTopLeft = Vec.Sub(center, Vec.Rot(new Vec(width / 2, height / 2), rotation))
-	const { x, y } = Mat.applyToPoint(Mat.Inverse(parentTransform), pageTopLeft)
+	// [6]
+	const { x, y } = Vec.Sub(center, Vec.Rot(new Vec(width / 2, height / 2), rotation))
 	const id = createShapeId()
 	editor.createShape<TLGeoShape>({
 		id,
@@ -132,7 +141,7 @@ function createGeoShape(editor: Editor, { shape, recognition }: Stroke<GeoStroke
 		index: getIndexAbove(editor, shape),
 		x,
 		y,
-		rotation: canonicalizeRotation(rotation - parentTransform.rotation()),
+		rotation: canonicalizeRotation(rotation),
 		opacity: shape.opacity,
 		props: {
 			geo: recognition.kind,
@@ -141,13 +150,14 @@ function createGeoShape(editor: Editor, { shape, recognition }: Stroke<GeoStroke
 			flipY,
 			dash: 'draw',
 			color: shape.props.color,
-			fill: shape.props.fill,
+			// A draw shape only shows its fill once tldraw has decided it's closed.
+			fill: shape.props.isClosed ? shape.props.fill : 'none',
 			size: shape.props.size,
 			scale: shape.props.scale,
 		},
 	})
 
-	// [6]
+	// [7]
 	for (const binding of editor.getBindingsToShape<TLArrowBinding>(shape, 'arrow')) {
 		editor.updateBinding<TLArrowBinding>({
 			id: binding.id,
@@ -161,23 +171,23 @@ function createGeoShape(editor: Editor, { shape, recognition }: Stroke<GeoStroke
 
 function createLineOrArrow(
 	editor: Editor,
-	{ shape, recognition }: Stroke<LineStrokeRecognition>,
+	{ shape, recognition, parentTransform }: Stroke<LineStrokeRecognition>,
 	drawnArrowheads: DrawnArrowheads,
-	sources: Set<TLShapeId>
+	recognized: Set<TLShapeId>
 ): TLShapeId | null {
-	const startTarget = getConnectionTarget(editor, shape, recognition.start, sources)
-	const endTarget = getConnectionTarget(editor, shape, recognition.end, sources)
-	// [7]
-	const crossesOneShape = startTarget && startTarget === endTarget && !recognition.arcMidpoint
-	const targets = crossesOneShape ? {} : { start: startTarget, end: endTarget }
+	const { start, end } = recognition
+	const pageStart = Mat.applyToPoint(parentTransform, start)
+	const pageEnd = Mat.applyToPoint(parentTransform, end)
+	const targets = {
+		start: getConnectionTarget(editor, shape, pageStart, recognized),
+		end: getConnectionTarget(editor, shape, pageEnd, recognized),
+	}
 	const arrowheadAtStart = recognition.arrowheadAtStart || !!drawnArrowheads.start
 	const arrowheadAtEnd = recognition.arrowheadAtEnd || !!drawnArrowheads.end
 	const isArrow = !!(targets.start || targets.end || arrowheadAtStart || arrowheadAtEnd)
 	// A line shape can't bend, so an arc that doesn't become an arrow stays as ink.
 	if (!isArrow && recognition.arcMidpoint) return null
 
-	const start = editor.getPointInParentSpace(shape, recognition.start)
-	const end = editor.getPointInParentSpace(shape, recognition.end)
 	const id = createShapeId()
 	const base = {
 		id,
@@ -230,6 +240,7 @@ function createLineOrArrow(
 	})
 
 	// [9]
+	const pageEnds = { start: pageStart, end: pageEnd }
 	editor.createBindings(
 		(['start', 'end'] as const).flatMap((terminal) => {
 			const target = targets[terminal]
@@ -241,7 +252,7 @@ function createLineOrArrow(
 					toId: target.id,
 					props: {
 						terminal,
-						normalizedAnchor: getNormalizedAnchor(editor, target, recognition[terminal]),
+						normalizedAnchor: getNormalizedAnchor(editor, target, pageEnds[terminal]),
 						isPrecise: false,
 						isExact: false,
 						snap: 'none' as const,
@@ -255,7 +266,10 @@ function createLineOrArrow(
 	if (recognition.arcMidpoint) {
 		const arrow = editor.getShape<TLArrowShape>(id)!
 		const terminals = getArrowTerminalsInArrowSpace(editor, arrow, getArrowBindings(editor, arrow))
-		const middle = editor.getPointInShapeSpace(arrow, recognition.arcMidpoint)
+		const middle = editor.getPointInShapeSpace(
+			arrow,
+			Mat.applyToPoint(parentTransform, recognition.arcMidpoint)
+		)
 		editor.updateShape<TLArrowShape>({
 			id,
 			type: 'arrow',
@@ -268,26 +282,27 @@ function createLineOrArrow(
 function getConnectionTarget(
 	editor: Editor,
 	stroke: TLDrawShape,
-	point: VecLike,
-	sources: Set<TLShapeId>
+	pagePoint: VecLike,
+	recognized: Set<TLShapeId>
 ) {
-	return editor.getShapeAtPoint(point, {
+	const target = editor.getShapeAtPoint(pagePoint, {
 		hitInside: true,
 		margin: CONNECT_DISTANCE / editor.getZoomLevel(),
-		filter: (target) =>
-			!sources.has(target.id) &&
-			// The frame a stroke was drawn in isn't something it connects to.
-			!editor.hasAncestor(stroke, target.id) &&
+		filter: (shape) =>
+			!recognized.has(shape.id) &&
 			// Imprecise bindings aim at a shape's center, which only makes sense for closed shapes.
-			editor.getShapeGeometry(target).isClosed &&
-			editor.canBindShapes({ fromShape: { type: 'arrow' }, toShape: target, binding: 'arrow' }),
+			editor.getShapeGeometry(shape).isClosed &&
+			editor.canBindShapes({ fromShape: { type: 'arrow' }, toShape: shape, binding: 'arrow' }),
 	})
+	// The frame a stroke was drawn in isn't something it connects to. It's ruled out here rather than
+	// in the filter so that it still stops the search from reaching shapes hidden behind it.
+	return target && !editor.hasAncestor(stroke, target.id) ? target : undefined
 }
 
 /** Where `point` sits in the target's bounds, from (0, 0) at the top left to (1, 1) at the bottom right. */
-function getNormalizedAnchor(editor: Editor, target: TLShape, point: VecLike) {
+function getNormalizedAnchor(editor: Editor, target: TLShape, pagePoint: VecLike) {
 	const { bounds } = editor.getShapeGeometry(target)
-	const local = editor.getPointInShapeSpace(target, point)
+	const local = editor.getPointInShapeSpace(target, pagePoint)
 	return {
 		x: bounds.w ? Math.min(1, Math.max(0, (local.x - bounds.minX) / bounds.w)) : 0.5,
 		y: bounds.h ? Math.min(1, Math.max(0, (local.y - bounds.minY) / bounds.h)) : 0.5,
@@ -300,29 +315,43 @@ function matchArrowheads(
 	lines: Stroke<LineStrokeRecognition>[],
 	chevrons: Stroke<ChevronStrokeRecognition>[]
 ) {
+	// A line and its arrowhead can sit in different parents, so compare them on the page.
+	const pageChevrons = chevrons.map(({ shape, recognition, parentTransform }) => ({
+		id: shape.id,
+		apex: Mat.applyToPoint(parentTransform, recognition.apex),
+		direction: Vec.Rot(recognition.direction, parentTransform.rotation()),
+		size: recognition.size,
+	}))
+
 	const candidates: {
 		line: TLShapeId
 		terminal: 'start' | 'end'
 		chevron: TLShapeId
 		distance: number
 	}[] = []
-	for (const { shape, recognition } of lines) {
+	for (const { shape, recognition, parentTransform } of lines) {
 		const length = Vec.Dist(recognition.start, recognition.end)
 		for (const terminal of ['start', 'end'] as const) {
 			const hasHook =
 				terminal === 'start' ? recognition.arrowheadAtStart : recognition.arrowheadAtEnd
 			if (hasHook) continue
-			const outward = terminal === 'start' ? recognition.startDirection : recognition.endDirection
-			for (const chevron of chevrons) {
-				const { apex, direction, size } = chevron.recognition
-				const distance = Vec.Dist(apex, recognition[terminal])
-				const reach = Math.max(ARROWHEAD_REACH * size, CONNECT_DISTANCE / editor.getZoomLevel())
+			const point = Mat.applyToPoint(parentTransform, recognition[terminal])
+			const outward = Vec.Rot(
+				terminal === 'start' ? recognition.startDirection : recognition.endDirection,
+				parentTransform.rotation()
+			)
+			for (const chevron of pageChevrons) {
+				const distance = Vec.Dist(chevron.apex, point)
+				const reach = Math.max(
+					ARROWHEAD_REACH * chevron.size,
+					CONNECT_DISTANCE / editor.getZoomLevel()
+				)
 				if (
 					distance <= reach &&
-					Vec.Dpr(direction, outward) >= ARROWHEAD_ALIGNMENT &&
-					size <= MAX_ARROWHEAD_RATIO * length
+					Vec.Dpr(chevron.direction, outward) >= ARROWHEAD_ALIGNMENT &&
+					chevron.size <= MAX_ARROWHEAD_RATIO * length
 				) {
-					candidates.push({ line: shape.id, terminal, chevron: chevron.shape.id, distance })
+					candidates.push({ line: shape.id, terminal, chevron: chevron.id, distance })
 				}
 			}
 		}
@@ -349,33 +378,33 @@ function getIndexAbove(editor: Editor, shape: TLShape) {
 
 /*
 [1]
+Strokes are recognized in their parent's space, so a stroke drawn inside a rotated frame snaps
+to the frame's axes rather than the page's. Points that get hit-tested or compared across
+parents are moved onto the page with the parent's transform.
+
+[2]
 Everything between this stopping point and the next one is a single undo step, including the
 selection change. We only mark once we know there is something to convert, so pressing the
 shortcut on strokes that can't be recognized doesn't leave an empty step in the undo stack.
 
-[2]
+[3]
 Closed strokes become geo shapes first, so that lines and arrows created afterwards can connect to
 them as well as to shapes that were already on the canvas.
 
-[3]
-The strokes are deleted last because their replacements are placed relative to them: in their
-parent's space, at an index just above theirs.
-
 [4]
+The strokes are deleted last because their replacements are placed relative to them, at an index
+just above theirs.
+
+[5]
 Arcs that don't touch a shape and have no arrowhead stay as ink, so it's possible to get here
 without creating anything. `bailToMark` drops the stopping point along with the selection change.
 
-[5]
-A geo shape's x and y are its top-left corner in its parent's space, and it rotates about that
-corner. We work out the corner in page space from the fitted center, then move it into the parent,
-which may be a rotated frame.
-
 [6]
-Arrows that were already attached to the stroke stay attached to the shape that replaces it.
+A geo shape's x and y are its top-left corner in its parent's space, and it rotates about that
+corner, so we work back from the fitted center.
 
 [7]
-A straight stroke that starts and ends on the same shape was drawn across it, not between shapes.
-An arced one is a loop from the shape back to itself.
+Arrows that were already attached to the stroke stay attached to the shape that replaces it.
 
 [8]
 Arrowheads go where they were drawn. A connecting stroke with none drawn gets one where it ended.
