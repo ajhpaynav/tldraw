@@ -28,6 +28,10 @@ import {
 
 /** How close, in screen pixels, the end of a stroke has to come to a shape to connect to it. */
 const CONNECT_DISTANCE = 16
+/** Strokes smaller than this many screen pixels are dots and taps, not shapes. */
+const MIN_STROKE_SIZE = 6
+/** Arrowheads look about this many screen pixels long, however long the arrow. */
+const MIN_ARROWHEAD_LENGTH = 12
 /** A V caps a line when its apex is within this many arm lengths of the line's end... */
 const ARROWHEAD_REACH = 0.75
 /** ...points the same way as the line, give or take 40°... */
@@ -69,6 +73,7 @@ export function convertDrawingsToShapes(editor: Editor): ConversionResult {
 	const geoStrokes: Stroke<GeoStrokeRecognition>[] = []
 	const lineStrokes: Stroke<LineStrokeRecognition>[] = []
 	const chevronStrokes: Stroke<ChevronStrokeRecognition>[] = []
+	const zoom = editor.getZoomLevel()
 	for (const shape of strokes) {
 		// [1]
 		const points = editor
@@ -76,7 +81,10 @@ export function convertDrawingsToShapes(editor: Editor): ConversionResult {
 			.applyToPoints(
 				getPointsFromDrawSegments(shape.props.segments, shape.props.scaleX, shape.props.scaleY)
 			)
-		const recognition = recognizeStroke(points)
+		const recognition = recognizeStroke(points, {
+			minSize: MIN_STROKE_SIZE / zoom,
+			minArrowheadLength: MIN_ARROWHEAD_LENGTH / zoom,
+		})
 		const parentTransform = editor.getShapeParentTransform(shape)
 		if (recognition.kind === 'line') lineStrokes.push({ shape, recognition, parentTransform })
 		else if (recognition.kind === 'chevron') {
@@ -299,7 +307,7 @@ function getConnectionTarget(
 	return target && !editor.hasAncestor(stroke, target.id) ? target : undefined
 }
 
-/** Where `point` sits in the target's bounds, from (0, 0) at the top left to (1, 1) at the bottom right. */
+/** `pagePoint` within the target's bounds, from (0, 0) at top left to (1, 1) at bottom right. */
 function getNormalizedAnchor(editor: Editor, target: TLShape, pagePoint: VecLike) {
 	const { bounds } = editor.getShapeGeometry(target)
 	const local = editor.getPointInShapeSpace(target, pagePoint)
@@ -369,7 +377,7 @@ function matchArrowheads(
 	return matches
 }
 
-/** An index just above the stroke and below whatever sat above it, so the new shape takes its place. */
+/** An index between the stroke and whatever sat above it, so the new shape takes its place. */
 function getIndexAbove(editor: Editor, shape: TLShape) {
 	const siblings = editor.getSortedChildIdsForParent(shape.parentId)
 	const above = siblings[siblings.indexOf(shape.id) + 1]

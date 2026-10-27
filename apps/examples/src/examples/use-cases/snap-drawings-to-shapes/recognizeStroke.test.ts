@@ -195,8 +195,19 @@ describe('closed strokes', () => {
 		const left = recognizeStroke(draw(polygon(triangleCorners(center, 200, 160, -90 * DEG))))
 		expectGeo(left, { kind: 'triangle', rotation: -90 * DEG, width: 200, height: 160 })
 
-		const tilted = recognizeStroke(draw(polygon(triangleCorners(center, 200, 160, 30 * DEG))))
-		expectGeo(tilted, { kind: 'triangle', rotation: 30 * DEG, width: 200, height: 160 })
+		const tilted = recognizeStroke(draw(polygon(triangleCorners(center, 160, 240, 30 * DEG))))
+		expectGeo(tilted, { kind: 'triangle', rotation: 30 * DEG, width: 160, height: 240 })
+	})
+
+	it('keeps a nearly equilateral triangle level when it could be read either way', () => {
+		const equilateral = triangleCorners(center, 200, 173)
+		for (const seed of SEEDS) {
+			const corners = loopedCorners(equilateral, 6)
+			expectGeo(recognizeStroke(draw(polygon(corners), { jitter: 0.01, seed, count: 160 })), {
+				kind: 'triangle',
+				rotation: 0,
+			})
+		}
 	})
 
 	it('fits right triangles with the closest isosceles triangle', () => {
@@ -418,6 +429,23 @@ describe('open strokes', () => {
 		}
 	})
 
+	it('finds small arrowheads on long shafts when told how big a head looks', () => {
+		const from = new Vec(100, 300)
+		const tip = new Vec(1000, 300)
+		for (const seed of SEEDS) {
+			const points = draw(arrowWithHook(from, tip, 40, { double: true }), {
+				jitter: 0.002,
+				seed,
+				count: 300,
+			})
+			// 40px is under 5% of the shaft, which reads as a flick without a sense of scale.
+			const unscaled = recognizeStroke(points)
+			expect(unscaled.kind === 'line' && unscaled.arrowheadAtEnd).toBe(false)
+			const result = recognizeStroke(points, { minArrowheadLength: 12 })
+			expect(result.kind === 'line' && result.arrowheadAtEnd).toBe(true)
+		}
+	})
+
 	it('finds an arrowhead drawn at the start of the stroke', () => {
 		const tip = new Vec(100, 300)
 		const to = new Vec(450, 220)
@@ -456,9 +484,133 @@ describe('open strokes', () => {
 			}
 		}
 	})
+	it('treats tall humps as arcs, not as V-shaped arrowheads', () => {
+		for (const seed of SEEDS) {
+			for (const height of [0.25, 0.45]) {
+				const hump: Path = (t) => new Vec(100 + t * 300, 300 - Math.sin(t * Math.PI) * height * 300)
+				const result = recognizeStroke(draw(hump, { jitter: 0.006, seed }))
+				expect(result.kind).toBe('line')
+				expect(result.kind === 'line' && result.arcMidpoint).not.toBeNull()
+			}
+		}
+	})
+})
+
+describe('closed strokes as people draw them', () => {
+	const square = rectangleCorners(center, 160, 160)
+
+	it('keeps rectangles with rounded, looped, overshot or cut corners', () => {
+		const rectangle = rectangleCorners(center, 240, 150)
+		for (const seed of SEEDS) {
+			for (const corners of [
+				roundedRectangleCorners(center, 240, 150, 30),
+				loopedCorners(rectangle, 7.5),
+				overshotCorners(rectangle, 7.5),
+				chamferedCorners(rectangle, 15),
+			]) {
+				expectGeo(recognizeStroke(draw(polygon(corners), { jitter: 0.012, seed, count: 160 })), {
+					kind: 'rectangle',
+					rotation: 0,
+				})
+			}
+		}
+	})
+
+	it('reads a slightly sheared or messy upright square as a square, not a tilted diamond', () => {
+		for (const seed of SEEDS) {
+			for (const corners of [
+				shearedRectangleCorners(center, 160, 160, 0.08),
+				shearedRectangleCorners(center, 160, 160, 0.12),
+				loopedCorners(square, 5),
+				overshotCorners(square, 8),
+			]) {
+				const result = recognizeStroke(draw(polygon(corners), { jitter: 0.012, seed, count: 160 }))
+				expect(['rectangle', 'unknown']).toContain(result.kind)
+				if (result.kind === 'rectangle') expect(result.rotation).toBe(0)
+			}
+		}
+	})
+
+	it('reads a square on its corner as a diamond even when its tips are rounded or cut', () => {
+		for (const seed of SEEDS) {
+			for (const degrees of [40, 45, 50]) {
+				const rounded = roundedRectangleCorners(center, 160, 160, 32, degrees * DEG)
+				expectGeo(
+					recognizeStroke(draw(polygon(rounded, { start: 0.3 }), { jitter: 0.012, seed })),
+					{
+						kind: 'diamond',
+						rotation: 0,
+					}
+				)
+			}
+			const cut = chamferedCorners(rectangleCorners(center, 160, 160, 45 * DEG), 16)
+			expectGeo(recognizeStroke(draw(polygon(cut, { start: 0.1 }), { jitter: 0.012, seed })), {
+				kind: 'diamond',
+				rotation: 0,
+			})
+		}
+	})
+
+	it('keeps egg-shaped ellipses and their rotation', () => {
+		for (const seed of SEEDS) {
+			for (const k of [0.15, 0.35]) {
+				const path = egg(center, 200, 260, k, {
+					rotation: 30 * DEG,
+					start: 0.1 * seed,
+					sweep: 1.03,
+				})
+				expectGeo(recognizeStroke(draw(path, { jitter: 0.01, seed })), {
+					kind: 'ellipse',
+					rotation: 30 * DEG,
+				})
+			}
+		}
+	})
 })
 
 describe('strokes that should stay as ink', () => {
+	it('rejects clouds and closed semicircles, which an ellipse would only roughly fit', () => {
+		const semicircle = concat(
+			[arc(center, 120, Math.PI, 2 * Math.PI), polyline([new Vec(520, 300), new Vec(280, 300)])],
+			[Math.PI * 120, 240]
+		)
+		for (const seed of SEEDS) {
+			for (const bumps of [5, 8, 14]) {
+				const cloud = arcCloud(center, 320, 200, bumps, 0.4, { start: 0.05 * seed, sweep: 1.02 })
+				expect(recognizeStroke(draw(cloud, { jitter: 0.005, seed, count: 240 })).kind).toBe(
+					'unknown'
+				)
+			}
+			expect(recognizeStroke(draw(semicircle, { jitter: 0.008, seed })).kind).toBe('unknown')
+		}
+	})
+
+	it('rejects a loop with a tail that leaves it, like a 9, an a or a line into a box', () => {
+		const loop: Path = (t) => Vec.Add(center, Vec.FromAngle(-0.1 - t * 2 * Math.PI, 30))
+		const nine = concat([loop, polyline([loop(1), new Vec(424, 360)])], [60 * Math.PI, 60])
+		const a = concat(
+			[loop, polyline([loop(1), new Vec(430, 285), new Vec(430, 332)])],
+			[60 * Math.PI, 78]
+		)
+		const box = rectangleCorners(center, 160, 100)
+		const lineIntoBox = polyline([
+			Vec.Add(box[3], new Vec(-156, 36)),
+			box[3],
+			...box.slice(0, 3),
+			box[3],
+		])
+		const swirl = spiralClosure(center, 60, 1.6, 1, 0.35)
+		for (const seed of SEEDS) {
+			for (const path of [nine, a]) {
+				expect(recognizeStroke(draw(path, { jitter: 0.01, seed, count: 60 })).kind).toBe('unknown')
+			}
+			expect(recognizeStroke(draw(lineIntoBox, { jitter: 0.008, seed, count: 160 })).kind).toBe(
+				'unknown'
+			)
+			expect(recognizeStroke(draw(swirl, { jitter: 0.008, seed, count: 120 })).kind).toBe('unknown')
+		}
+	})
+
 	it('rejects scribbles', () => {
 		for (const seed of SEEDS) {
 			const random = mulberry32(seed)
@@ -502,7 +654,72 @@ describe('strokes that should stay as ink', () => {
 		expect(recognizeStroke(draw(backAndForth, { jitter: 0.005 })).kind).toBe('unknown')
 	})
 
-	it('rejects dots and empty strokes', () => {
+	it("doesn't read check marks, Ls or retraced ends as arrowheads", () => {
+		for (const seed of SEEDS) {
+			const check = polyline([new Vec(100, 200), new Vec(140, 250), new Vec(260, 100)])
+			const lShape = polyline([new Vec(100, 100), new Vec(100, 300), new Vec(160, 285)])
+			const retrace = polyline([new Vec(100, 300), new Vec(400, 300), new Vec(330, 302)])
+			for (const path of [check, lShape, retrace]) {
+				const result = recognizeStroke(draw(path, { jitter: 0.006, seed, count: 120 }))
+				expect(result.kind === 'line' && (result.arrowheadAtStart || result.arrowheadAtEnd)).toBe(
+					false
+				)
+			}
+		}
+	})
+
+	it('rejects zigzag and wavy strike-throughs and multi-pass scribbles', () => {
+		const zigzag = polyline(
+			Array.from({ length: 13 }, (_, i) => new Vec(100 + i * 25, i % 2 ? 290 : 300))
+		)
+		const wavy: Path = (t) => new Vec(100 + t * 300, 300 + Math.sin(t * Math.PI * 12) * 9)
+		const passes = polyline([
+			new Vec(100, 300),
+			new Vec(400, 304),
+			new Vec(104, 308),
+			new Vec(398, 312),
+		])
+		for (const seed of SEEDS) {
+			for (const path of [zigzag, wavy, passes]) {
+				expect(recognizeStroke(draw(path, { jitter: 0.003, seed, count: 160 })).kind).toBe(
+					'unknown'
+				)
+			}
+		}
+	})
+
+	it('rejects parallelograms and trapezoids, which no geo shape fits', () => {
+		const parallelogram = [
+			new Vec(300, 250),
+			new Vec(560, 250),
+			new Vec(500, 350),
+			new Vec(240, 350),
+		]
+		const trapezoid = [new Vec(330, 250), new Vec(470, 250), new Vec(520, 350), new Vec(280, 350)]
+		for (const seed of SEEDS) {
+			for (const corners of [parallelogram, trapezoid]) {
+				expect(recognizeStroke(draw(polygon(corners), { jitter: 0.008, seed })).kind).toBe(
+					'unknown'
+				)
+			}
+		}
+	})
+
+	it("doesn't read a bent line, like a stick figure's leg, as an arc", () => {
+		for (const seed of SEEDS) {
+			const leg = polyline([new Vec(100, 100), new Vec(140, 250), new Vec(120, 400)])
+			const result = recognizeStroke(draw(leg, { jitter: 0.004, seed }))
+			expect(result.kind === 'line' && result.arcMidpoint).toBeFalsy()
+		}
+	})
+
+	it('rejects dots and taps smaller than the minimum size', () => {
+		const dot = draw(ellipse(center, 4, 4))
+		expect(recognizeStroke(dot).kind).not.toBe('unknown')
+		expect(recognizeStroke(dot, { minSize: 6 }).kind).toBe('unknown')
+	})
+
+	it('rejects empty strokes', () => {
 		expect(recognizeStroke([]).kind).toBe('unknown')
 		expect(recognizeStroke([{ x: 5, y: 5 }]).kind).toBe('unknown')
 		expect(
@@ -536,6 +753,142 @@ describe('getBendThroughPoint', () => {
 		}
 	})
 })
+
+function roundedRectangleCorners(c: Vec, width: number, height: number, r: number, rotation = 0) {
+	const corners = [
+		[width / 2 - r, -height / 2 + r, -90],
+		[width / 2 - r, height / 2 - r, 0],
+		[-width / 2 + r, height / 2 - r, 90],
+		[-width / 2 + r, -height / 2 + r, 180],
+	]
+	return corners.flatMap(([x, y, from]) =>
+		Array.from({ length: 9 }, (_, k) =>
+			Vec.Add(
+				c,
+				Vec.Rot(Vec.Add(new Vec(x, y), Vec.FromAngle((from + (90 * k) / 8) * DEG, r)), rotation)
+			)
+		)
+	)
+}
+
+/** A small loop outside each corner, as when a fast corner overshoots and curls back. */
+function loopedCorners(corners: Vec[], r: number) {
+	return corners.flatMap((corner, i) => {
+		const incoming = Vec.Sub(corner, corners.at(i - 1)!).uni()
+		const outgoing = Vec.Sub(corners[(i + 1) % corners.length], corner).uni()
+		const loopCenter = Vec.Add(corner, Vec.Sub(incoming, outgoing).uni().mul(r))
+		const radial = Vec.Sub(corner, loopCenter)
+		const turn = Vec.Dpr(Vec.Per(radial), Vec.Add(incoming, outgoing)) > 0 ? -1 : 1
+		const loop = Array.from({ length: 13 }, (_, k) =>
+			Vec.Add(loopCenter, Vec.Rot(radial, (turn * 2 * Math.PI * (k + 1)) / 14))
+		)
+		return [corner, ...loop, corner.clone()]
+	})
+}
+
+/** The pen runs past each corner, then cuts back onto the next side. */
+function overshotCorners(corners: Vec[], d: number) {
+	return corners.flatMap((corner, i) => {
+		const incoming = Vec.Sub(corner, corners.at(i - 1)!).uni()
+		const outgoing = Vec.Sub(corners[(i + 1) % corners.length], corner).uni()
+		return [
+			Vec.Add(corner, incoming.clone().mul(d)),
+			Vec.Add(corner, Vec.Sub(outgoing.clone().mul(d * 0.6), incoming.clone().mul(d * 0.2))),
+		]
+	})
+}
+
+function chamferedCorners(corners: Vec[], d: number) {
+	return corners.flatMap((corner, i) => [
+		Vec.Add(
+			corner,
+			Vec.Sub(corners.at(i - 1)!, corner)
+				.uni()
+				.mul(d)
+		),
+		Vec.Add(
+			corner,
+			Vec.Sub(corners[(i + 1) % corners.length], corner)
+				.uni()
+				.mul(d)
+		),
+	])
+}
+
+/** The top edge slides right and the bottom edge left. */
+function shearedRectangleCorners(c: Vec, width: number, height: number, shear: number) {
+	const s = (shear * width) / 2
+	return [
+		new Vec(-width / 2 + s, -height / 2),
+		new Vec(width / 2 + s, -height / 2),
+		new Vec(width / 2 - s, height / 2),
+		new Vec(-width / 2 - s, height / 2),
+	].map((p) => Vec.Add(c, p))
+}
+
+/** An ellipse that widens towards the bottom. */
+function egg(c: Vec, w: number, h: number, k: number, { rotation = 0, start = 0, sweep = 1 } = {}) {
+	return (t: number) => {
+		const a = (start + t * sweep) * Math.PI * 2
+		const y = Math.sin(a)
+		return Vec.Add(
+			c,
+			Vec.Rot(new Vec(((Math.cos(a) * w) / 2) * (1 + k * y), (y * h) / 2), rotation)
+		)
+	}
+}
+
+/** A diagram cloud: circular bumps between points on an ellipse. `bulge` is sagitta over chord. */
+function arcCloud(
+	c: Vec,
+	w: number,
+	h: number,
+	bumps: number,
+	bulge: number,
+	{ start = 0, sweep = 1 } = {}
+): Path {
+	const anchors = Array.from({ length: bumps }, (_, i) => {
+		const a = ((i + (i % 2 ? 0.15 : 0)) / bumps) * Math.PI * 2
+		return Vec.Add(c, new Vec((Math.cos(a) * w) / 2, (Math.sin(a) * h) / 2))
+	})
+	const path = polyline(
+		anchors
+			.flatMap((a, i) => {
+				const b = anchors[(i + 1) % bumps]
+				const out = Vec.Per(Vec.Sub(b, a)).uni()
+				if (Vec.Dpr(out, Vec.Sub(Vec.Med(a, b), c)) < 0) out.neg()
+				const sagitta = bulge * Vec.Dist(a, b)
+				return Array.from({ length: 12 }, (_, k) => {
+					const t = k / 12
+					return Vec.Add(Vec.Lrp(a, b, t), Vec.Mul(out, Math.sin(t * Math.PI) * sagitta))
+				})
+			})
+			.concat(anchors[0])
+	)
+	return (t) => path((((start + t * sweep) % 1) + 1) % 1)
+}
+
+/** A circle drawn for `sweep` turns, its radius ramping to `scaleEnd` from turn `from` on. */
+function spiralClosure(c: Vec, r: number, sweep: number, from: number, scaleEnd: number): Path {
+	return (t) => {
+		const turns = t * sweep
+		const k = turns < from ? 1 : 1 + ((scaleEnd - 1) * (turns - from)) / (sweep - from)
+		return Vec.Add(c, Vec.FromAngle(turns * Math.PI * 2, r * k))
+	}
+}
+
+/** Joins paths end to end, giving each a share of t proportional to its weight. */
+function concat(paths: Path[], weights: number[]): Path {
+	const total = weights.reduce((a, b) => a + b, 0)
+	return (t) => {
+		let d = t * total
+		for (let i = 0; i < paths.length - 1; i++) {
+			if (d <= weights[i]) return paths[i](d / weights[i])
+			d -= weights[i]
+		}
+		return paths[paths.length - 1](Math.min(1, d / weights[weights.length - 1]))
+	}
+}
 
 function circleCenter(a: Vec, b: Vec, c: Vec) {
 	const d = 2 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y))
