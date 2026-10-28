@@ -1,0 +1,64 @@
+.drawing-to-mermaid {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	width: min(480px, calc(100vw - 32px));
+	margin-top: 8px;
+	padding: 8px;
+	font-size: 12px;
+	line-height: 1.4;
+	color: var(--tl-color-text-1);
+	pointer-events: all;
+	user-select: text;
+}
+
+.drawing-to-mermaid__row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px;
+}
+
+.drawing-to-mermaid__hints {
+	flex: 1;
+	min-width: 160px;
+	height: 32px;
+	padding: 0 8px;
+	border: 1px solid var(--tl-color-divider);
+	border-radius: 6px;
+	background: var(--tl-color-low);
+	color: inherit;
+	font: inherit;
+	pointer-events: auto;
+}
+
+.drawing-to-mermaid__source {
+	min-height: 160px;
+	padding: 8px;
+	border: 1px solid var(--tl-color-divider);
+	border-radius: 6px;
+	background: var(--tl-color-low);
+	color: inherit;
+	font-family: ui-monospace, monospace;
+	font-size: 12px;
+	resize: vertical;
+	pointer-events: auto;
+}
+
+.drawing-to-mermaid__error {
+	padding: 8px;
+	border-radius: 6px;
+	white-space: pre-wrap;
+	background: #f8d7da;
+	color: #842029;
+}
+
+.drawing-to-mermaid__notes {
+	margin: 0;
+	padding-left: 18px;
+	color: var(--tl-color-text-3);
+}
+
+.drawing-to-mermaid__meta {
+	color: var(--tl-color-text-3);
+}

@@ -1,6 +1,7 @@
+import type { IncomingMessage } from 'http'
 import path from 'path'
 import react from '@vitejs/plugin-react'
-import { Plugin, PluginOption, defineConfig } from 'vite'
+import { Plugin, PluginOption, defineConfig, loadEnv } from 'vite'
 
 /**
  * Plugin to enable SPA fallback for vite preview.
@@ -23,6 +24,97 @@ function spaFallbackPlugin(): Plugin {
 					req.url = '/index.html' + (url.includes('?') ? url.substring(url.indexOf('?')) : '')
 				}
 				next()
+			})
+		},
+	}
+}
+
+const TYPESAFE_MAX_BODY_BYTES = 32 * 1024 * 1024
+
+/**
+ * Why a request may not use the TypeSafe proxy, which spends the developer's key. The dev server
+ * listens on the network (`vite --host`) and accepts any Host (`allowedHosts: true`), so checking
+ * that the caller is this machine isn't enough on its own.
+ */
+function getTypesafeProxyRefusal(req: IncomingMessage): string | undefined {
+	const remote = req.socket.remoteAddress ?? ''
+	if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote)) {
+		return 'The TypeSafe proxy only accepts requests from this machine.'
+	}
+	// A tunnel (ngrok, cloudflared, editor port forwarding) connects from this machine on behalf of
+	// whoever has its URL.
+	if (req.headers['forwarded'] || req.headers['x-forwarded-for']) {
+		return 'The TypeSafe proxy does not accept forwarded requests.'
+	}
+	// A DNS-rebinding page reaches this machine under its own domain name.
+	const host = req.headers.host ?? ''
+	if (!['localhost', '127.0.0.1', '[::1]'].includes(host.replace(/:\d+$/, ''))) {
+		return 'The TypeSafe proxy only accepts requests to localhost.'
+	}
+	// Any other site open in the browser can also POST here from this machine. Cross-site requests
+	// carry their origin, and a JSON content type forces a CORS preflight that Vite refuses.
+	const origin = req.headers.origin
+	const site = req.headers['sec-fetch-site']
+	if ((origin && origin !== `http://${host}`) || (site && site !== 'same-origin')) {
+		return 'The TypeSafe proxy only accepts requests from this app.'
+	}
+	if (!req.headers['content-type']?.includes('application/json')) {
+		return 'Send the request as application/json.'
+	}
+	return undefined
+}
+
+/**
+ * Dev-server proxy for the drawing to Mermaid example. The TypeSafe API key is read from
+ * TYPESAFE_API_KEY (e.g. in apps/examples/.env.local) and never reaches the browser.
+ */
+function typesafeProxyPlugin(apiKey: string | undefined): Plugin {
+	return {
+		name: 'typesafe-proxy',
+		apply: 'serve',
+		configureServer(server) {
+			server.middlewares.use('/api/typesafe/systemone', async (req, res) => {
+				const sendError = (status: number, error: string) => {
+					res.statusCode = status
+					res.setHeader('content-type', 'application/json')
+					// The proxy's own errors won't go away on retry, unlike TypeSafe's 429s and 5xxs.
+					res.setHeader('x-typesafe-proxy-error', '1')
+					res.end(JSON.stringify({ error }))
+				}
+				if (req.method !== 'POST') return sendError(405, 'Use POST.')
+				const refusal = getTypesafeProxyRefusal(req)
+				if (refusal) return sendError(403, refusal)
+				if (!apiKey) {
+					return sendError(
+						503,
+						'TYPESAFE_API_KEY is not set. Add it to apps/examples/.env.local and restart the dev server.'
+					)
+				}
+				try {
+					const chunks: Buffer[] = []
+					let size = 0
+					for await (const chunk of req) {
+						size += chunk.length
+						if (size > TYPESAFE_MAX_BODY_BYTES) return sendError(413, 'Request body is too large.')
+						chunks.push(chunk)
+					}
+					const upstream = await fetch('https://api.typesafe.ai/v1/systemone', {
+						method: 'POST',
+						headers: {
+							authorization: `Bearer ${apiKey}`,
+							'content-type': 'application/json',
+							'TypeSafe-Danger-Zone-Images': 'true',
+						},
+						body: Buffer.concat(chunks),
+					})
+					res.statusCode = upstream.status
+					res.setHeader('content-type', upstream.headers.get('content-type') ?? 'application/json')
+					const retryAfter = upstream.headers.get('retry-after')
+					if (retryAfter) res.setHeader('retry-after', retryAfter)
+					res.end(Buffer.from(await upstream.arrayBuffer()))
+				} catch (e) {
+					sendError(502, `Could not reach TypeSafe: ${e instanceof Error ? e.message : String(e)}`)
+				}
 			})
 		},
 	}
@@ -73,7 +165,12 @@ const TLDRAW_BEMO_URL_STRING =
 				: undefined
 
 export default defineConfig(({ mode }) => ({
-	plugins: [spaFallbackPlugin(), react(), exampleReadmePlugin()],
+	plugins: [
+		spaFallbackPlugin(),
+		react(),
+		exampleReadmePlugin(),
+		typesafeProxyPlugin(loadEnv(mode, __dirname, 'TYPESAFE_').TYPESAFE_API_KEY),
+	],
 	root: path.join(__dirname, 'src'),
 	publicDir: path.join(__dirname, 'public'),
 	build: {
